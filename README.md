@@ -51,13 +51,46 @@ ipc_socket = $XDG_RUNTIME_DIR/mopidy-mpv.sock
 mpv_command =          # optional; blank = mpv is managed externally
 ```
 
-## Install
+## Installation
+
+### Requirements
+
+- **Mopidy** ≥ 3.4 and **Python** ≥ 3.9 (`pykka` ≥ 4.0 comes in as a dependency).
+- **mpv** installed and on `PATH`, managed externally (see
+  [How it expects to run](#how-it-expects-to-run)).
+- For YouTube/yt-dlp sources: **yt-dlp** available to mpv's `ytdl_hook`, and a
+  **JavaScript runtime** (deno or node) for signature/n-challenge solving.
+
+### Install the extension
+
+Not on PyPI yet — install from the repository.
+
+From GitHub:
 
 ```
+pip install git+https://github.com/davidj4tech/mopidy-mpv.git
+```
+
+Or for development, clone and install editable:
+
+```
+git clone https://github.com/davidj4tech/mopidy-mpv.git
+cd mopidy-mpv
 pip install -e .
 ```
 
-Mopidy discovers it via the `mopidy.ext` entry point.
+Install it into the **same environment as Mopidy** so it's discovered via the
+`mopidy.ext` entry point. Verify it loaded:
+
+```
+mopidy deps | grep -i mpv     # should list Mopidy-Mpv
+```
+
+### Enable & configure
+
+Add the `[mpv]` section to your `mopidy.conf` (see [Config](#config)), point
+`ipc_socket` at the socket your externally-managed mpv exposes, then start mpv
+([How it expects to run](#how-it-expects-to-run)) and restart Mopidy.
 
 ## Status
 
