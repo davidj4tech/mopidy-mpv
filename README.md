@@ -92,6 +92,43 @@ Add the `[mpv]` section to your `mopidy.conf` (see [Config](#config)), point
 `ipc_socket` at the socket your externally-managed mpv exposes, then start mpv
 ([How it expects to run](#how-it-expects-to-run)) and restart Mopidy.
 
+## Usage
+
+This backend has no UI of its own — you drive it by enqueuing `mpv:` URIs
+through any Mopidy frontend (MPD, the HTTP/JSON-RPC API, Iris, etc.). mpv does
+the resolving and decoding; Mopidy stays the queue / now-playing brain.
+
+Using an MPD client (`mpc`) against Mopidy's MPD frontend:
+
+```console
+# A YouTube video — yt: takes a full URL, normalised for mpv's ytdl_hook
+$ mpc add "mpv:yt:https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+$ mpc play
+> Never Gonna Give You Up
+[playing] #1/1   0:03/3:32 (1%)
+
+# Shorthand forms the backend also accepts
+$ mpc add "mpv:youtube:video:dQw4w9WgXcQ"
+
+# A direct internet-radio stream or a local file
+$ mpc add "mpv:https://stream.example.com/radio.mp3"
+$ mpc add "mpv:file:///home/me/Music/track.flac"
+```
+
+Via Mopidy's HTTP JSON-RPC API:
+
+```console
+$ curl -s http://localhost:6680/mopidy/rpc -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"core.tracklist.add",
+         "params":{"uris":["mpv:yt:https://youtu.be/dQw4w9WgXcQ"]}}'
+$ curl -s http://localhost:6680/mopidy/rpc -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":2,"method":"core.playback.play"}'
+```
+
+For **search / browse**, pair with Mopidy-YouTube or Mopidy-Stream (this backend
+is lookup-only): discover a track there, then route it through the `mpv:` scheme
+to play it via mpv.
+
 ## Status
 
 Working PoC. Provides backend + mixer; no playlists/browse provider by design.
