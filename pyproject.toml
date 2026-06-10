@@ -11,6 +11,9 @@ dependencies = [
     "mopidy>=3.4",
     "pykka>=4.0",
 ]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+]
 
 # This is what makes Mopidy discover the extension at startup.
 [project.entry-points."mopidy.ext"]
