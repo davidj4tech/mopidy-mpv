@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=66"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Mopidy-Mpv"
+version = "0.1.0"
+description = "Mopidy backend that plays URIs through an external mpv via JSON-IPC"
+requires-python = ">=3.9"
+dependencies = [
+    "mopidy>=3.4",
+    "pykka>=4.0",
+]
+
+# This is what makes Mopidy discover the extension at startup.
+[project.entry-points."mopidy.ext"]
+mpv = "mopidy_mpv:Extension"
+
+[tool.setuptools.packages.find]
+include = ["mopidy_mpv*"]
+
+[tool.setuptools.package-data]
+mopidy_mpv = ["ext.conf"]
