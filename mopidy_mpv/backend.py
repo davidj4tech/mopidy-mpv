@@ -28,9 +28,24 @@ def _mpv_body(uri):
     return uri[len("mpv:"):] if uri.startswith("mpv:") else uri
 
 
+# Optional per-track control fragment: "...#dev=<audio-device>" pins mpv's output
+# for that track (e.g. "#dev=pulse/am" for a whole-house sink, "#dev=auto" for
+# the default device). Lets a single mpv broker be told, per play, where to send
+# audio — used by Mopidy-Books to offer "rooms" vs "at desk" picks in Iris.
+_DEV_MARKER = "#dev="
+
+
+def _split_device(s):
+    """(clean, device|None) — strip a trailing #dev=<value> control fragment."""
+    i = s.rfind(_DEV_MARKER)
+    if i != -1:
+        return s[:i], s[i + len(_DEV_MARKER):]
+    return s, None
+
+
 def _local_path(uri):
     """Filesystem path for a local-file mpv: URI, else None (yt/http/stream)."""
-    body = _mpv_body(uri)
+    body, _dev = _split_device(_mpv_body(uri))
     if body.startswith("file://"):
         body = unquote(urlparse(body).path)
     if body.startswith("/") and os.path.isfile(body):
@@ -44,7 +59,7 @@ def _title_for(uri):
     For a local file we clean up the basename (drop dir + extension, underscores
     to spaces) so even an untagged file reads as a title rather than a path.
     """
-    body = _mpv_body(uri)
+    body, _dev = _split_device(_mpv_body(uri))
     for prefix in ("youtube:video:", "yt:video:", "youtube:", "yt:"):
         if body.startswith(prefix):
             return f"YouTube {body[len(prefix):]}"
@@ -141,6 +156,7 @@ class MpvPlaybackProvider(backend.PlaybackProvider):
         self._reported_state = "stopped"  # mirrors what we last told core
         self._last_title = None           # de-dupe tags_changed emissions
         self._core = None                 # lazily-resolved Core proxy
+        self._current_device = None       # per-track audio-device from #dev=
 
     # -- helpers -----------------------------------------------------------
     def _reset_ipc(self):
@@ -220,10 +236,13 @@ class MpvPlaybackProvider(backend.PlaybackProvider):
         # PoT) resolves it.
         #   mpv:youtube:video:dQw4w9WgXcQ -> https://www.youtube.com/watch?v=...
         #   mpv:https://youtu.be/...      -> https://youtu.be/...  (as-is)
-        return youtube_to_url(self._strip_scheme(uri))
+        body, _dev = _split_device(self._strip_scheme(uri))
+        return youtube_to_url(body)
 
     def change_track(self, track):
         self._current_uri = self.translate_uri(track.uri)
+        # Remember any per-track output pin so play() can apply it pre-loadfile.
+        _body, self._current_device = _split_device(self._strip_scheme(track.uri))
         return True
 
     def play(self):
@@ -233,6 +252,14 @@ class MpvPlaybackProvider(backend.PlaybackProvider):
         for attempt in (1, 2):
             ipc = self._ensure_ipc()
             try:
+                # Pin this track's output device first (e.g. rooms vs at-desk),
+                # so the very first samples land on the chosen sink.
+                if self._current_device:
+                    try:
+                        ipc.set_property("audio-device", self._current_device)
+                    except Exception:
+                        logger.warning("mpv: set audio-device %s failed",
+                                       self._current_device, exc_info=True)
                 # loadfile replace = start fresh; mpv starts unpaused.
                 ipc.command("loadfile", self._current_uri, "replace")
                 ipc.set_property("pause", False)
