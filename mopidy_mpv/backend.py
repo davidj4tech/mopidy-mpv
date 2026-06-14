@@ -9,11 +9,13 @@ the things you want mpv to play through the mpv: scheme.
 """
 
 import logging
+import os
+from urllib.parse import unquote, urlparse
 
 import pykka
 
 from mopidy import backend, audio
-from mopidy.models import Track
+from mopidy.models import Album, Artist, Track
 
 from .mpv_ipc import MpvIPC
 
@@ -22,13 +24,88 @@ logger = logging.getLogger(__name__)
 _YT_WATCH = "https://www.youtube.com/watch?v={}"
 
 
+def _mpv_body(uri):
+    return uri[len("mpv:"):] if uri.startswith("mpv:") else uri
+
+
+def _local_path(uri):
+    """Filesystem path for a local-file mpv: URI, else None (yt/http/stream)."""
+    body = _mpv_body(uri)
+    if body.startswith("file://"):
+        body = unquote(urlparse(body).path)
+    if body.startswith("/") and os.path.isfile(body):
+        return body
+    return None
+
+
 def _title_for(uri):
-    """A human-ish name for an mpv: URI, shown until real metadata arrives."""
-    body = uri[len("mpv:"):] if uri.startswith("mpv:") else uri
+    """A human-ish name for an mpv: URI, shown until real metadata arrives.
+
+    For a local file we clean up the basename (drop dir + extension, underscores
+    to spaces) so even an untagged file reads as a title rather than a path.
+    """
+    body = _mpv_body(uri)
     for prefix in ("youtube:video:", "yt:video:", "youtube:", "yt:"):
         if body.startswith(prefix):
             return f"YouTube {body[len(prefix):]}"
+    path = _local_path(uri)
+    if path:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        return stem.replace("_", " ").strip() or body
     return body
+
+
+# path -> (mtime, {title, artist, album}); avoids re-probing on every lookup().
+_tag_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _read_tags(path):
+    """Embedded title/artist/album for a local audio file (mutagen, cached)."""
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return {}
+    hit = _tag_cache.get(path)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    tags = {}
+    try:
+        from mutagen import File as MutagenFile
+        mf = MutagenFile(path, easy=True)
+        if mf is not None:
+            def first(*keys):
+                for k in keys:
+                    v = mf.get(k)
+                    if v:
+                        return v[0]
+                return None
+            tags = {
+                "title": first("title"),
+                "artist": first("artist", "albumartist", "composer"),
+                "album": first("album"),
+            }
+    except Exception:  # noqa: BLE001 — tags are best-effort
+        logger.debug("tag read failed for %s", path, exc_info=True)
+    _tag_cache[path] = (mtime, tags)
+    return tags
+
+
+# path -> (mtime, bool): does the file carry embedded cover art?
+_cover_cache: dict[str, tuple[float, bool]] = {}
+
+
+def _has_cover(path):
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return False
+    hit = _cover_cache.get(path)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    from .http import extract_cover
+    present = extract_cover(path)[0] is not None
+    _cover_cache[path] = (mtime, present)
+    return present
 
 
 def youtube_to_url(rest):
@@ -277,7 +354,30 @@ class MpvLibraryProvider(backend.LibraryProvider):
     def lookup(self, uri):
         if not uri.startswith("mpv:"):
             return []
+        path = _local_path(uri)
+        if path:
+            t = _read_tags(path)
+            kwargs = {"uri": uri, "name": t.get("title") or _title_for(uri)}
+            if t.get("artist"):
+                kwargs["artists"] = [Artist(name=t["artist"])]
+            if t.get("album"):
+                kwargs["album"] = Album(name=t["album"])
+            return [Track(**kwargs)]
+        # Non-local (YouTube/http/stream): mpv fills the title at playback time.
         return [Track(uri=uri, name=_title_for(uri))]
+
+    def get_images(self, uris):
+        """Cover art for local mpv: tracks, served by our /mpv/ http app."""
+        from urllib.parse import quote
+        from mopidy.models import Image
+        result = {}
+        for uri in uris:
+            path = _local_path(uri)
+            if path and _has_cover(path):
+                result[uri] = [Image(uri="/mpv/cover?path=" + quote(path))]
+            else:
+                result[uri] = []
+        return result
 
     def get_chapters(self, uris):
         """Chapters / cue points for mpv: URIs, from mpv's own chapter-list.

@@ -21,7 +21,11 @@ class Extension(ext.Extension):
 
     def setup(self, registry):
         from .backend import MpvBackend
+        from .http import mpv_http_factory
         from .mixer import MpvMixer
 
         registry.add("backend", MpvBackend)
         registry.add("mixer", MpvMixer)
+        # Serves embedded cover art at /mpv/cover for local mpv: tracks, so
+        # get_images() can hand web clients (Iris) a fetchable artwork URL.
+        registry.add("http:app", {"name": "mpv", "factory": mpv_http_factory})
