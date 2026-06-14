@@ -63,6 +63,7 @@ class MpvPlaybackProvider(backend.PlaybackProvider):
         self._current_uri = None
         self._reported_state = "stopped"  # mirrors what we last told core
         self._last_title = None           # de-dupe tags_changed emissions
+        self._core = None                 # lazily-resolved Core proxy
 
     # -- helpers -----------------------------------------------------------
     def _reset_ipc(self):
@@ -99,6 +100,23 @@ class MpvPlaybackProvider(backend.PlaybackProvider):
         ipc.command("observe_property", 11, "pause")
         self._ipc = ipc
         return self._ipc
+
+    def _core_proxy(self):
+        # Backends aren't handed a Core ref, but the actor is in the registry.
+        # We need it for one thing: forcing core back to PLAYING when mpv is
+        # un-paused by *another* IPC client (e.g. agent-media resuming the book
+        # channel after speech). Core's audio-event handler only syncs the
+        # PAUSED direction (mopidy core actor.py: "temporary fix for #232"), so
+        # an external resume would otherwise leave core/Iris stuck on paused.
+        if self._core is None:
+            try:
+                from mopidy.core import Core
+                refs = pykka.ActorRegistry.get_by_class(Core)
+                if refs:
+                    self._core = refs[0].proxy()
+            except Exception:
+                logger.exception("mpv: could not resolve Core proxy")
+        return self._core
 
     @staticmethod
     def _looks_like_url_fallback(title):
@@ -228,6 +246,20 @@ class MpvPlaybackProvider(backend.PlaybackProvider):
                     new_state=new_state,
                     target_state=None,
                 )
+                # Core's audio-event handler only acts on the ->PAUSED edge, so
+                # an external un-pause (another IPC client resumed mpv) leaves
+                # core stuck on paused. Drive it back to PLAYING explicitly.
+                # Fire-and-forget the proxy call (no .get()) so we don't block
+                # the IPC reader thread. The guard above means we only do this
+                # for *external* changes — our own resume() already set
+                # _reported_state to "playing" before mpv echoes the event.
+                if new_state == "playing":
+                    core = self._core_proxy()
+                    if core is not None:
+                        try:
+                            core.playback.resume()
+                        except Exception:
+                            logger.exception("mpv: core resume() failed")
 
 
 class MpvLibraryProvider(backend.LibraryProvider):
