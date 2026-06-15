@@ -10,7 +10,8 @@ the things you want mpv to play through the mpv: scheme.
 
 import logging
 import os
-from urllib.parse import unquote, urlparse
+import re
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pykka
 
@@ -22,6 +23,88 @@ from .mpv_ipc import MpvIPC
 logger = logging.getLogger(__name__)
 
 _YT_WATCH = "https://www.youtube.com/watch?v={}"
+
+# Where the BOOK channel's YouTube pickers live (EXTM3Us written by
+# gen-youtube-books-m3u, with #EXTINF titles). We mine those titles so Iris can
+# show real names + thumbnails for mpv: YouTube tracks instead of bare URLs —
+# library.lookup() otherwise has no metadata for a watch URL.
+_YT_PLAYLISTS_DIR = os.path.expanduser("~/.local/share/mopidy-books/playlists")
+_YT_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{11}\Z")
+
+
+def _youtube_id(body):
+    """Extract an 11-char YouTube video id from an mpv: body, else None.
+
+    Handles watch URLs (?v=ID), youtu.be/ID, and the youtube:/yt: wrapper forms
+    (youtube:video:ID, yt:video:ID, youtube:ID, yt:ID).
+    """
+    for prefix in ("youtube:video:", "yt:video:", "youtube:", "yt:"):
+        if body.startswith(prefix):
+            rest = body[len(prefix):]
+            if not rest.startswith(("http://", "https://", "ytdl://")):
+                return rest if _YT_ID_RE.match(rest) else None
+            body = rest
+            break
+    if body.startswith(("http://", "https://")):
+        try:
+            u = urlparse(body)
+        except ValueError:
+            return None
+        if u.netloc.endswith("youtu.be"):
+            vid = u.path.lstrip("/").split("/")[0]
+            return vid if _YT_ID_RE.match(vid) else None
+        if "youtube.com" in u.netloc:
+            vid = (parse_qs(u.query).get("v") or [""])[0]
+            return vid if _YT_ID_RE.match(vid) else None
+    return None
+
+
+# {video_id: title}, rebuilt from the picker m3u files when they change.
+_yt_title_cache: dict = {}
+_yt_title_mtime = [0.0]
+
+
+def _yt_titles():
+    """{video_id: title} mined from the book-channel picker m3u files (cached).
+
+    Reparses only when the playlists dir's newest mtime changes, so a profile
+    switch / refresh is picked up without a Mopidy restart.
+    """
+    try:
+        entries = os.scandir(_YT_PLAYLISTS_DIR)
+    except OSError:
+        return _yt_title_cache
+    files, newest = [], 0.0
+    for e in entries:
+        if e.name.endswith((".m3u8", ".m3u")):
+            files.append(e.path)
+            try:
+                newest = max(newest, e.stat().st_mtime)
+            except OSError:
+                pass
+    if newest == _yt_title_mtime[0] and _yt_title_cache:
+        return _yt_title_cache
+    titles = {}
+    for path in files:
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        pending = None
+        for line in lines:
+            if line.startswith("#EXTINF:"):
+                pending = line.split(",", 1)[1].strip() if "," in line else None
+            elif line and not line.startswith("#"):
+                body = _mpv_body(line.strip())
+                vid = _youtube_id(body)
+                if vid and pending:
+                    titles[vid] = pending
+                pending = None
+    _yt_title_cache.clear()
+    _yt_title_cache.update(titles)
+    _yt_title_mtime[0] = newest
+    return _yt_title_cache
 
 
 def _mpv_body(uri):
@@ -60,9 +143,12 @@ def _title_for(uri):
     to spaces) so even an untagged file reads as a title rather than a path.
     """
     body, _dev = _split_device(_mpv_body(uri))
-    for prefix in ("youtube:video:", "yt:video:", "youtube:", "yt:"):
-        if body.startswith(prefix):
-            return f"YouTube {body[len(prefix):]}"
+    vid = _youtube_id(body)
+    if vid:
+        title = _yt_titles().get(vid)
+        if title:
+            return title
+        return f"YouTube {vid}"
     path = _local_path(uri)
     if path:
         stem = os.path.splitext(os.path.basename(path))[0]
@@ -157,6 +243,8 @@ class MpvPlaybackProvider(backend.PlaybackProvider):
         self._last_title = None           # de-dupe tags_changed emissions
         self._core = None                 # lazily-resolved Core proxy
         self._current_device = None       # per-track audio-device from #dev=
+        self._last_pos_ms = 0             # position captured at last pause()
+        self._pending_seek_ms = None      # seek to apply once a reload loads
 
     # -- helpers -----------------------------------------------------------
     def _reset_ipc(self):
@@ -261,6 +349,7 @@ class MpvPlaybackProvider(backend.PlaybackProvider):
                         logger.warning("mpv: set audio-device %s failed",
                                        self._current_device, exc_info=True)
                 # loadfile replace = start fresh; mpv starts unpaused.
+                self._pending_seek_ms = None  # fresh play: start at 0
                 ipc.command("loadfile", self._current_uri, "replace")
                 ipc.set_property("pause", False)
                 self._reported_state = "playing"
@@ -277,12 +366,48 @@ class MpvPlaybackProvider(backend.PlaybackProvider):
         return False
 
     def resume(self):
-        self._ensure_ipc().set_property("pause", False)
+        ipc = self._ensure_ipc()
+        # Self-heal the dead-resume case: if the stream dropped to idle while
+        # Mopidy still thinks it's merely paused (network stream timed out, hit
+        # EOF, or was stopped by another IPC client), un-pausing an idle mpv is
+        # a silent no-op — the "play does nothing after pause" bug. Detect the
+        # idle and reload the current URI, seeking back to where we paused.
+        try:
+            idle = bool(ipc.get_property("idle-active"))
+        except Exception:  # noqa: BLE001
+            idle = False
+        if idle and self._current_uri:
+            try:
+                if self._current_device:
+                    ipc.set_property("audio-device", self._current_device)
+                # Seek back to the paused position once the reload lands
+                # (file-loaded), so coming back to a long-dropped book/video
+                # doesn't restart from 0.
+                self._pending_seek_ms = self._last_pos_ms or None
+                ipc.command("loadfile", self._current_uri, "replace")
+                ipc.set_property("pause", False)
+                self._reported_state = "playing"
+                return True
+            except Exception:  # noqa: BLE001
+                logger.warning("mpv resume-reload failed for %s",
+                               self._current_uri, exc_info=True)
+                self._reset_ipc()
+                ipc = self._ensure_ipc()
+        ipc.set_property("pause", False)
         self._reported_state = "playing"
         return True
 
     def pause(self):
-        self._ensure_ipc().set_property("pause", True)
+        ipc = self._ensure_ipc()
+        # Remember where we are so resume() can restore it if the stream has
+        # since dropped to idle (see resume()).
+        try:
+            pos = ipc.get_property("time-pos")
+            if pos is not None:
+                self._last_pos_ms = int(pos * 1000)
+        except Exception:  # noqa: BLE001
+            pass
+        ipc.set_property("pause", True)
         self._reported_state = "paused"
         return True
 
@@ -320,6 +445,16 @@ class MpvPlaybackProvider(backend.PlaybackProvider):
         elif name == "file-loaded" and self._current_uri:
             # New stream actually started playing -> let core/Iris refresh.
             audio.AudioListener.send("stream_changed", uri=self._current_uri)
+            # If this load was a resume-reload (stream had dropped to idle),
+            # jump back to where we paused now that the demuxer is ready.
+            if self._pending_seek_ms:
+                pos_s = self._pending_seek_ms / 1000.0
+                self._pending_seek_ms = None
+                try:
+                    self._ipc.command("seek", pos_s, "absolute")
+                except Exception:  # noqa: BLE001
+                    logger.debug("mpv resume-seek to %.1fs failed", pos_s,
+                                 exc_info=True)
 
         elif name == "property-change" and evt.get("name") == "media-title":
             # Live ICY/stream title (radio) — but ignore mpv's URL fallback.
@@ -402,6 +537,14 @@ class MpvLibraryProvider(backend.LibraryProvider):
             path = _local_path(uri)
             if path and _has_cover(path):
                 result[uri] = [Image(uri="/mpv/cover?path=" + quote(path))]
+                continue
+            vid = _youtube_id(_split_device(_mpv_body(uri))[0])
+            if vid:
+                # Deterministic YouTube thumbnail CDN URL. The *browser* (phone/
+                # laptop) fetches this from i.ytimg.com — not mel — so mel's
+                # YouTube IP block is irrelevant. mqdefault = 320x180, light.
+                result[uri] = [Image(
+                    uri=f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg")]
             else:
                 result[uri] = []
         return result
