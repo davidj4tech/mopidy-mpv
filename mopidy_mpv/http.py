@@ -24,6 +24,8 @@ _YT_PROFILE = os.path.expanduser("~/.local/bin/yt-profile")
 _ACTIVE_BOOK = os.path.join(_COOKIES_DIR, "active-book.txt")
 _NAME_RE = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 
+_TV_VIDEO = os.path.expanduser("~/.local/bin/tv-video")
+
 
 def extract_cover(path):
     """(bytes, mime) for the file's embedded cover, or (None, None)."""
@@ -179,8 +181,49 @@ class BookSwitcherHandler(tornado.web.RequestHandler):
         self.write(_SWITCHER_HTML.format(options=opts))
 
 
+class TvVideoHandler(tornado.web.RequestHandler):
+    """Play the currently-playing track on the lounge TV's mpvKt (TV-only audio).
+
+    GET /mpv/tv -> take the now-playing track, stop Mopidy's audio (so the
+    am-music Snapcast feed goes quiet and the TV isn't double-audioed), and
+    hand the track URI to ~/.local/bin/tv-video, which resolves it (YouTube via
+    the TV's own yt-dlp) and fires it into mpvKt. Fire-and-forget; returns at
+    once. Only video-ish URIs (yt:/youtube:/http) are meaningful — tv-video
+    rejects anything it can't map.
+    """
+
+    def initialize(self, core):
+        self.core = core
+
+    def get(self):
+        tl = self.core.playback.get_current_tl_track().get()
+        if tl is None:
+            self.set_status(409)
+            self.write({"ok": False, "error": "nothing is playing"})
+            return
+        uri = tl.track.uri
+        if not uri.startswith(("yt:", "youtube:", "http://", "https://")):
+            self.set_status(415)
+            self.write({"ok": False, "error": "not a video track", "uri": uri})
+            return
+        # Quiet Mopidy so am-music stops; the TV plays the video with its own
+        # (perfectly synced) audio via mpvKt.
+        try:
+            self.core.playback.stop()
+        except Exception:  # noqa: BLE001
+            logger.debug("core.playback.stop() failed", exc_info=True)
+        subprocess.Popen(
+            [_TV_VIDEO, uri],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.write({"ok": True, "uri": uri, "note": "playing on TV"})
+
+
 def mpv_http_factory(config, core):
-    # Mounted at /mpv/ -> /mpv/cover, /mpv/ytbook (switch API), /mpv/books (UI).
+    # Mounted at /mpv/ -> /mpv/cover, /mpv/ytbook (switch API), /mpv/books (UI),
+    # /mpv/tv (play now-playing on the lounge TV's mpvKt).
     return [(r"/cover", CoverHandler),
             (r"/ytbook", BookProfileHandler),
-            (r"/books", BookSwitcherHandler)]
+            (r"/books", BookSwitcherHandler),
+            (r"/tv", TvVideoHandler, dict(core=core))]
