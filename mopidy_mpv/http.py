@@ -9,6 +9,8 @@ use Mopidy-Local, which is what normally serves local images).
 
 import logging
 import os
+import re
+import subprocess
 from urllib.parse import unquote
 
 import tornado.web
@@ -16,6 +18,11 @@ import tornado.web
 logger = logging.getLogger(__name__)
 
 _AUDIO_EXT = (".m4b", ".m4a", ".mp3", ".aac", ".opus", ".ogg", ".oga", ".flac")
+
+_COOKIES_DIR = os.path.expanduser("~/.config/yt-dlp/cookies")
+_YT_PROFILE = os.path.expanduser("~/.local/bin/yt-profile")
+_ACTIVE_BOOK = os.path.join(_COOKIES_DIR, "active-book.txt")
+_NAME_RE = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 
 
 def extract_cover(path):
@@ -66,6 +73,48 @@ class CoverHandler(tornado.web.RequestHandler):
         self.write(data)
 
 
+class BookProfileHandler(tornado.web.RequestHandler):
+    """Switch the BOOK channel's YouTube account from the web UI (Iris Commands).
+
+    GET /mpv/ytbook            -> {"current": "<name>"} (book-channel profile)
+    GET /mpv/ytbook?name=<n>   -> repoint active-book.txt and (in the background)
+                                  regenerate that account's playlist pickers.
+                                  Returns immediately; pickers appear on the next
+                                  Iris playlists Refresh (the m3u backend re-scans
+                                  live, so no Mopidy restart is needed).
+
+    Only names matching an existing `<name>.txt` cookie jar are accepted, so the
+    argument can't traverse paths or inject a command (passed as a list to Popen).
+    """
+
+    def _current(self):
+        try:
+            return os.path.basename(os.readlink(_ACTIVE_BOOK))[:-4]
+        except OSError:
+            return None
+
+    def get(self):
+        name = self.get_argument("name", "")
+        if not name:
+            self.write({"current": self._current()})
+            return
+        if not _NAME_RE.match(name) or not os.path.isfile(
+                os.path.join(_COOKIES_DIR, f"{name}.txt")):
+            self.set_status(400)
+            self.write({"ok": False, "error": f"unknown profile {name!r}"})
+            return
+        # Fire-and-forget: `yt-profile book use` repoints + regenerates pickers
+        # (no restart). Detached so this request returns instantly even though a
+        # big account takes ~1-2 min to enumerate.
+        subprocess.Popen(
+            [_YT_PROFILE, "book", "use", name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.write({"ok": True, "name": name,
+                    "note": "switching — Refresh the Iris playlists view shortly"})
+
+
 def mpv_http_factory(config, core):
-    # Mounted at /mpv/ -> route is /mpv/cover.
-    return [(r"/cover", CoverHandler)]
+    # Mounted at /mpv/ -> routes are /mpv/cover and /mpv/ytbook.
+    return [(r"/cover", CoverHandler), (r"/ytbook", BookProfileHandler)]
