@@ -184,25 +184,34 @@ class BookSwitcherHandler(tornado.web.RequestHandler):
 class TvVideoHandler(tornado.web.RequestHandler):
     """Play the currently-playing track on the lounge TV's mpvKt (TV-only audio).
 
-    GET /mpv/tv -> take the now-playing track, stop Mopidy's audio (so the
-    am-music Snapcast feed goes quiet and the TV isn't double-audioed), and
-    hand the track URI to ~/.local/bin/tv-video, which resolves it (YouTube via
-    the TV's own yt-dlp) and fires it into mpvKt. Fire-and-forget; returns at
-    once. Only video-ish URIs (yt:/youtube:/http) are meaningful — tv-video
-    rejects anything it can't map.
+    GET /mpv/tv            -> play the NOW-PLAYING track on the TV.
+    GET /mpv/tv?uri=<u>    -> play a SPECIFIC track (the one a context menu was
+                             opened on) on the TV, regardless of what's playing.
+
+    Either way: stop Mopidy's audio (so the am-music Snapcast feed goes quiet and
+    the TV isn't double-audioed) and hand the URI to ~/.local/bin/tv-video, which
+    resolves it (YouTube via the TV's own yt-dlp) and fires it into mpvKt.
+    Fire-and-forget; returns at once. Our own `mpv:` wrapper is stripped first so
+    book-channel tracks (mpv:https://…) work, not just bare youtube:/http URIs.
     """
 
     def initialize(self, core):
         self.core = core
 
     def get(self):
-        tl = self.core.playback.get_current_tl_track().get()
-        if tl is None:
-            self.set_status(409)
-            self.write({"ok": False, "error": "nothing is playing"})
-            return
-        uri = tl.track.uri
-        if not uri.startswith(("yt:", "youtube:", "http://", "https://")):
+        uri = self.get_argument("uri", "")
+        if not uri:
+            tl = self.core.playback.get_current_tl_track().get()
+            if tl is None:
+                self.set_status(409)
+                self.write({"ok": False, "error": "nothing is playing"})
+                return
+            uri = tl.track.uri
+        # Drop our scheme wrapper so the check + tv-video see the real media URI
+        # (mpv:https://… -> https://…, mpv:youtube:video:ID -> youtube:video:ID).
+        clean = uri[len("mpv:"):] if uri.startswith("mpv:") else uri
+        if not (clean.startswith(("yt:", "youtube:", "http://", "https://",
+                                  "file://")) or clean.startswith("/")):
             self.set_status(415)
             self.write({"ok": False, "error": "not a video track", "uri": uri})
             return
@@ -213,7 +222,7 @@ class TvVideoHandler(tornado.web.RequestHandler):
         except Exception:  # noqa: BLE001
             logger.debug("core.playback.stop() failed", exc_info=True)
         subprocess.Popen(
-            [_TV_VIDEO, uri],
+            [_TV_VIDEO, clean],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
