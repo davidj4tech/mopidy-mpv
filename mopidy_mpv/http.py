@@ -115,6 +115,72 @@ class BookProfileHandler(tornado.web.RequestHandler):
                     "note": "switching — Refresh the Iris playlists view shortly"})
 
 
+def _book_profiles():
+    """[(name, is_current)] of selectable book profiles + 'none'; OAuth excluded
+    (OAuth tokens HTTP-400 on library reads, so they're useless for the book
+    channel)."""
+    try:
+        current = os.path.basename(os.readlink(_ACTIVE_BOOK))[:-4]
+    except OSError:
+        current = "none"
+    names = []
+    try:
+        for f in sorted(os.listdir(_COOKIES_DIR)):
+            if not f.endswith(".txt"):
+                continue
+            n = f[:-4]
+            if n.startswith("active") or n == "none":
+                continue
+            try:
+                with open(os.path.join(_COOKIES_DIR, n + ".json")) as jf:
+                    if '"refresh_token"' in jf.read():
+                        continue
+            except OSError:
+                pass
+            names.append(n)
+    except OSError:
+        pass
+    names.append("none")
+    return [(n, n == current) for n in names]
+
+
+# Standalone, phone-friendly switcher page. Bookmark it on Android; the <select>
+# scales to any number of profiles. Talks to /mpv/ytbook (same origin).
+_SWITCHER_HTML = """<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Book account</title><style>
+ body{{font-family:system-ui,sans-serif;max-width:480px;margin:1.5rem auto;padding:0 1.2rem;color:#222}}
+ h2{{font-weight:600}} select{{font-size:1.25rem;padding:.7rem;width:100%;border-radius:.6rem;border:1px solid #bbb}}
+ #status{{margin-top:1.1rem;min-height:1.4em;color:#666}} small{{color:#999}}
+</style></head><body>
+<h2>\U0001F4D6 Book channel &middot; YouTube account</h2>
+<select id=sel>{options}</select>
+<p id=status></p>
+<p><small>Pick an account, then hit Refresh in the Iris playlists view. First load of a big account takes ~1&ndash;2&nbsp;min; switching back is instant.</small></p>
+<script>
+ var sel=document.getElementById('sel'),st=document.getElementById('status');
+ sel.onchange=function(){{
+   st.textContent='Switching to '+sel.value+'\\u2026';
+   fetch('/mpv/ytbook?name='+encodeURIComponent(sel.value)).then(function(r){{return r.json()}})
+    .then(function(j){{st.textContent=j.ok?(j.note||'Switched.'):('Error: '+(j.error||'failed'))}})
+    .catch(function(e){{st.textContent='Error: '+e}});
+ }};
+</script></body></html>"""
+
+
+class BookSwitcherHandler(tornado.web.RequestHandler):
+    def get(self):
+        opts = "".join(
+            '<option value="{n}"{sel}>{label}</option>'.format(
+                n=n, sel=(" selected" if cur else ""),
+                label=(n + " — off" if n == "none" else n))
+            for n, cur in _book_profiles())
+        self.set_header("Content-Type", "text/html; charset=utf-8")
+        self.write(_SWITCHER_HTML.format(options=opts))
+
+
 def mpv_http_factory(config, core):
-    # Mounted at /mpv/ -> routes are /mpv/cover and /mpv/ytbook.
-    return [(r"/cover", CoverHandler), (r"/ytbook", BookProfileHandler)]
+    # Mounted at /mpv/ -> /mpv/cover, /mpv/ytbook (switch API), /mpv/books (UI).
+    return [(r"/cover", CoverHandler),
+            (r"/ytbook", BookProfileHandler),
+            (r"/books", BookSwitcherHandler)]
