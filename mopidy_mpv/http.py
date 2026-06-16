@@ -7,12 +7,13 @@ have no way to load artwork for files we play through the mpv: scheme (we don't
 use Mopidy-Local, which is what normally serves local images).
 """
 
+import json
 import logging
 import os
 import re
 import secrets
 import subprocess
-from urllib.parse import unquote
+from urllib.parse import unquote, urlencode
 
 import tornado.web
 
@@ -212,8 +213,8 @@ _SWITCHER_HTML = """<!doctype html><html><head><meta charset=utf-8>
  };
  var addBtn=document.getElementById('add'),as=document.getElementById('addstatus'),poll=null;
  function render(j){
-   if(j.state==='authorize'){
-     as.innerHTML='<a class=go target=_blank rel=noopener href="'+esc(j.verification_url_complete||j.verification_url)+'" style="display:inline-block;background:#1b1b1b;color:#fff;padding:.5rem .9rem;border-radius:.5rem;text-decoration:none">Approve in Google \\u2192</a><br><small>code <b>'+esc(j.user_code||'')+'</b> is pre-filled \\u2014 just confirm</small>';
+   if(j.state==='authorize'){var u=j.auth_url||j.verification_url_complete||j.verification_url;
+     as.innerHTML='<a class=go target=_blank rel=noopener href="'+esc(u)+'" style="display:inline-block;background:#1b1b1b;color:#fff;padding:.5rem .9rem;border-radius:.5rem;text-decoration:none">'+(j.auth_url?'Sign in with Google \\u2192':'Approve in Google \\u2192')+'</a><br><small>'+(j.auth_url?'approve in the Google tab (opens automatically)':'code <b>'+esc(j.user_code||'')+'</b> is pre-filled \\u2014 just confirm')+'</small>';
    } else if(j.state==='starting'){ as.textContent='Starting Google login\\u2026'; }
    else if(j.state==='enumerating'){ as.textContent='Approved \\u2713 (as '+esc(j.channel||'')+') — loading your playlists\\u2026'; }
    else if(j.state==='done'){ clearInterval(poll);poll=null;addBtn.disabled=false;
@@ -226,6 +227,7 @@ _SWITCHER_HTML = """<!doctype html><html><head><meta charset=utf-8>
    addBtn.disabled=true; as.textContent='Starting Google login\\u2026';
    fetch('/mpv/ytadd',{method:'POST'}).then(function(r){return r.json()})
     .then(function(j){ if(!j.ok||!j.handle){addBtn.disabled=false;as.textContent='Error: '+(j.error||'failed');return;}
+      if(j.auth_url){window.open(j.auth_url,'_blank');}
       var h=j.handle;
       poll=setInterval(function(){
         fetch('/mpv/ytadd?h='+encodeURIComponent(h)).then(function(r){return r.json()}).then(render).catch(function(){});
@@ -251,6 +253,35 @@ _YT_GOOGLE_ADD = os.path.expanduser("~/.local/bin/yt-google-add")
 _YT_PROFILE_BIN = os.path.expanduser("~/.local/bin/yt-profile")
 _YTADD_STATUS = os.path.expanduser("~/.local/state/agent-media/ytadd")
 _HANDLE_RE = re.compile(r"\A[0-9a-f]{8,32}\Z")
+# Optional "Web application" OAuth client (oauth_web.json: client_id,
+# client_secret, redirect_uri) enables the fully code-free auth-code/redirect
+# flow. Absent -> we fall back to the device flow (one-tap pre-filled code).
+_OAUTH_WEB = os.path.join(_COOKIES_DIR, "oauth_web.json")
+_AUTH_EP = "https://accounts.google.com/o/oauth2/v2/auth"
+_YT_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+
+
+def _web_client():
+    try:
+        with open(_OAUTH_WEB) as f:
+            w = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if w.get("client_id") and w.get("client_secret") and w.get("redirect_uri"):
+        return w
+    return None
+
+
+def _status_path(handle):
+    return os.path.join(_YTADD_STATUS, handle + ".json")
+
+
+def _write_status(handle, obj):
+    os.makedirs(_YTADD_STATUS, exist_ok=True)
+    tmp = _status_path(handle) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, _status_path(handle))
 
 
 class YtAddHandler(tornado.web.RequestHandler):
@@ -273,18 +304,79 @@ class YtAddHandler(tornado.web.RequestHandler):
             self.write({"state": "error", "message": "bad handle"})
             return
         try:
-            with open(os.path.join(_YTADD_STATUS, handle + ".json")) as f:
+            with open(_status_path(handle)) as f:
                 self.write(f.read())
         except OSError:
             self.write({"state": "idle"})
 
     def post(self):
         handle = secrets.token_hex(8)
+        web = _web_client()
+        if web:
+            # Fully code-free auth-code flow: hand the page a Google sign-in URL
+            # to open; Google redirects to /mpv/ytcb?code=&state=<handle>, which
+            # exchanges the code and finishes. Seed an 'authorize' status so the
+            # popover shows "waiting for approval" + a fallback link.
+            auth_url = _AUTH_EP + "?" + urlencode({
+                "client_id": web["client_id"],
+                "redirect_uri": web["redirect_uri"],
+                "response_type": "code", "scope": _YT_SCOPE,
+                "access_type": "offline", "prompt": "consent",
+                "include_granted_scopes": "true", "state": handle})
+            _write_status(handle, {"state": "authorize", "mode": "redirect",
+                                   "auth_url": auth_url})
+            self.write({"ok": True, "handle": handle, "mode": "redirect",
+                        "auth_url": auth_url})
+            return
+        # Device flow (no web client configured): yt-google-add does it all.
         subprocess.Popen(
             [_YT_GOOGLE_ADD, handle],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True)
-        self.write({"ok": True, "handle": handle})
+        self.write({"ok": True, "handle": handle, "mode": "device"})
+
+
+_YTCB_PAGE = ("<!doctype html><meta charset=utf-8>"
+              "<meta name=viewport content='width=device-width,initial-scale=1'>"
+              "<body style='font-family:system-ui;max-width:420px;margin:3rem auto;"
+              "padding:0 1.2rem;text-align:center;color:#222'>"
+              "<h2>{title}</h2><p style='color:#666'>{body}</p></body>")
+
+
+class YtCbHandler(tornado.web.RequestHandler):
+    """OAuth redirect target for the code-free flow.
+
+    GET /mpv/ytcb?code=&state=<handle>  (Google sends the user here after they
+    approve). Validates the handle, hands the code to yt-google-add --code in
+    the background (which exchanges it + enumerates), and shows a close-this-tab
+    page. The in-Iris popover polls the handle and shows the result.
+    """
+
+    def get(self):
+        state = self.get_argument("state", "")
+        err = self.get_argument("error", "")
+        code = self.get_argument("code", "")
+        self.set_header("Content-Type", "text/html; charset=utf-8")
+        if not _HANDLE_RE.match(state) or not os.path.exists(_status_path(state)):
+            self.set_status(400)
+            self.write(_YTCB_PAGE.format(
+                title="Invalid or expired sign-in",
+                body="Please start again from Iris."))
+            return
+        if err or not code:
+            _write_status(state, {"state": "error",
+                                  "message": "login " + (err or "cancelled")})
+            self.write(_YTCB_PAGE.format(
+                title="Sign-in cancelled",
+                body="You can close this tab."))
+            return
+        subprocess.Popen(
+            [_YT_GOOGLE_ADD, "--code", state, code],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        self.write(_YTCB_PAGE.format(
+            title="Approved ✓",
+            body="Finishing up — you can close this tab and return to Iris."))
 
 
 class YtDelHandler(tornado.web.RequestHandler):
@@ -369,6 +461,7 @@ def mpv_http_factory(config, core):
     return [(r"/cover", CoverHandler),
             (r"/ytbook", BookProfileHandler),
             (r"/ytadd", YtAddHandler),
+            (r"/ytcb", YtCbHandler),
             (r"/ytdel", YtDelHandler),
             (r"/books", BookSwitcherHandler),
             (r"/tv", TvVideoHandler, dict(core=core))]
