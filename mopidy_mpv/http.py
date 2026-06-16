@@ -10,6 +10,7 @@ use Mopidy-Local, which is what normally serves local images).
 import logging
 import os
 import re
+import secrets
 import subprocess
 from urllib.parse import unquote
 
@@ -98,7 +99,11 @@ class BookProfileHandler(tornado.web.RequestHandler):
     def get(self):
         name = self.get_argument("name", "")
         if not name:
-            self.write({"current": self._current()})
+            # No name -> current + the full selectable list (for the in-Iris
+            # account popover to build its dropdown without a separate page).
+            self.write({"current": self._current(),
+                        "profiles": [{"name": n, "oauth": o}
+                                     for n, _cur, o in _book_profiles()]})
             return
         if not _NAME_RE.match(name) or not os.path.isfile(
                 os.path.join(_COOKIES_DIR, f"{name}.txt")):
@@ -162,24 +167,32 @@ _SWITCHER_HTML = """<!doctype html><html><head><meta charset=utf-8>
 <title>Book account</title><style>
  body{font-family:system-ui,sans-serif;max-width:480px;margin:1.5rem auto;padding:0 1.2rem;color:#222}
  h2{font-weight:600} h3{font-weight:600;font-size:1rem;margin:1.6rem 0 .5rem}
- select,input{font-size:1.15rem;padding:.6rem;width:100%;border-radius:.6rem;border:1px solid #bbb;box-sizing:border-box}
+ select{font-size:1.15rem;padding:.6rem;width:100%;border-radius:.6rem;border:1px solid #bbb;box-sizing:border-box}
  button{font-size:1.05rem;padding:.6rem 1rem;margin-top:.6rem;border:0;border-radius:.6rem;background:#1b1b1b;color:#fff;cursor:pointer}
- button[disabled]{opacity:.5}
+ button[disabled]{opacity:.5} button.ghost{background:#fff;color:#b00;border:1px solid #ddd}
+ #back{background:none;color:#0a58ca;padding:.2rem 0;font-size:1rem;margin:0 0 .6rem}
+ .row{display:flex;gap:.6rem} .row select{flex:1}
  #status,#addstatus{margin-top:1rem;min-height:1.4em;color:#555}
  .code{font:700 1.5rem/1.2 ui-monospace,monospace;letter-spacing:.12em;background:#f3f3f3;padding:.5rem .7rem;border-radius:.5rem;display:inline-block;margin:.3rem 0}
  a.go{display:inline-block;margin-top:.4rem} small{color:#999} hr{border:0;border-top:1px solid #eee;margin:1.6rem 0}
 </style></head><body>
+<button id=back>‹ Back</button>
 <h2>\U0001F4D6 Book channel &middot; YouTube account</h2>
-<select id=sel>__OPTIONS__</select>
+<div class=row><select id=sel>__OPTIONS__</select><button id=del class=ghost title="Remove this account">Remove</button></div>
 <p id=status></p>
 <p><small>Pick an account, then hit Refresh in the Iris playlists view. First load of a big account takes ~1&ndash;2&nbsp;min; switching back is instant.</small></p>
 <hr>
 <h3>➕ Add account &middot; Google login</h3>
-<input id=name placeholder="name for this account (e.g. davids-youtube)" autocapitalize=off autocorrect=off spellcheck=false>
 <button id=add>Sign in with Google</button>
 <div id=addstatus></div>
-<p><small>No cookie upload needed. Your playlists are read via YouTube's official API and the login refreshes itself. (Shows your <em>own</em> playlists, not ones saved from other channels.)</small></p>
+<p><small>No cookie upload needed — the account is named after your YouTube channel automatically, your playlists are read via YouTube's official API, and the login refreshes itself. (Shows your <em>own</em> playlists, not ones saved from other channels.)</small></p>
 <script>
+ function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+ // Standalone (bookmarked) page: offer Back to Iris. When embedded in the
+ // in-Iris overlay frame, the overlay's × closes it, so hide Back.
+ (function(){var b=document.getElementById('back');
+  if(window.self!==window.top){b.style.display='none';}
+  else{b.onclick=function(){ if(history.length>1){history.back();} else {location.href='/iris/';} };}})();
  var sel=document.getElementById('sel'),st=document.getElementById('status');
  sel.onchange=function(){
    st.textContent='Switching to '+sel.value+'\\u2026';
@@ -187,28 +200,35 @@ _SWITCHER_HTML = """<!doctype html><html><head><meta charset=utf-8>
     .then(function(j){st.textContent=j.ok?(j.note||'Switched.'):('Error: '+(j.error||'failed'))})
     .catch(function(e){st.textContent='Error: '+e});
  };
- var addBtn=document.getElementById('add'),nameEl=document.getElementById('name'),as=document.getElementById('addstatus'),poll=null;
- function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+ document.getElementById('del').onclick=function(){
+   var n=sel.value;
+   if(n==='none'){st.textContent='Nothing to remove.';return;}
+   if(!confirm('Remove account "'+n+'"? This deletes its saved login and playlists from the book channel.'))return;
+   st.textContent='Removing '+n+'\\u2026';
+   fetch('/mpv/ytdel?name='+encodeURIComponent(n),{method:'POST'}).then(function(r){return r.json()})
+    .then(function(j){ if(j.ok){st.textContent='Removed '+n+'. Reloading\\u2026';setTimeout(function(){location.reload()},900);}
+      else {st.textContent='Error: '+(j.error||'failed');} })
+    .catch(function(e){st.textContent='Error: '+e});
+ };
+ var addBtn=document.getElementById('add'),as=document.getElementById('addstatus'),poll=null;
  function render(j){
    if(j.state==='authorize'){
-     as.innerHTML='Open <a class=go target=_blank rel=noopener href="'+esc(j.verification_url)+'">'+esc(j.verification_url)+'</a> and enter:<br><span class=code>'+esc(j.user_code||'')+'</span><br><small>Waiting for you to approve\\u2026</small>';
+     as.innerHTML='<a class=go target=_blank rel=noopener href="'+esc(j.verification_url_complete||j.verification_url)+'" style="display:inline-block;background:#1b1b1b;color:#fff;padding:.5rem .9rem;border-radius:.5rem;text-decoration:none">Approve in Google \\u2192</a><br><small>code <b>'+esc(j.user_code||'')+'</b> is pre-filled \\u2014 just confirm</small>';
    } else if(j.state==='starting'){ as.textContent='Starting Google login\\u2026'; }
-   else if(j.state==='enumerating'){ as.textContent='Approved \\u2713  Loading your playlists\\u2026'; }
+   else if(j.state==='enumerating'){ as.textContent='Approved \\u2713 (as '+esc(j.channel||'')+') — loading your playlists\\u2026'; }
    else if(j.state==='done'){ clearInterval(poll);poll=null;addBtn.disabled=false;
-     as.innerHTML='\\u2713 Added '+esc(nameEl.value)+' with '+(j.playlists||0)+' playlists. Reloading\\u2026';
-     setTimeout(function(){location.reload()},1500); }
+     as.innerHTML='\\u2713 Added <b>'+esc(j.channel||j.name||'')+'</b> with '+(j.playlists||0)+' playlists. Reloading\\u2026';
+     setTimeout(function(){location.reload()},1600); }
    else if(j.state==='error'){ clearInterval(poll);poll=null;addBtn.disabled=false;
      as.textContent='Error: '+(j.message||'failed'); }
  }
  addBtn.onclick=function(){
-   var name=(nameEl.value||'').trim();
-   if(!/^[A-Za-z0-9_-]{1,40}$/.test(name)){as.textContent='Pick a name: letters, numbers, - or _ (no spaces).';return;}
    addBtn.disabled=true; as.textContent='Starting Google login\\u2026';
-   fetch('/mpv/ytadd?name='+encodeURIComponent(name),{method:'POST'})
-    .then(function(r){return r.json()})
-    .then(function(j){ if(!j.ok){addBtn.disabled=false;as.textContent='Error: '+(j.error||'failed');return;}
+   fetch('/mpv/ytadd',{method:'POST'}).then(function(r){return r.json()})
+    .then(function(j){ if(!j.ok||!j.handle){addBtn.disabled=false;as.textContent='Error: '+(j.error||'failed');return;}
+      var h=j.handle;
       poll=setInterval(function(){
-        fetch('/mpv/ytadd?name='+encodeURIComponent(name)).then(function(r){return r.json()}).then(render).catch(function(){});
+        fetch('/mpv/ytadd?h='+encodeURIComponent(h)).then(function(r){return r.json()}).then(render).catch(function(){});
       },2500);
     }).catch(function(e){addBtn.disabled=false;as.textContent='Error: '+e});
  };
@@ -228,52 +248,70 @@ class BookSwitcherHandler(tornado.web.RequestHandler):
 
 
 _YT_GOOGLE_ADD = os.path.expanduser("~/.local/bin/yt-google-add")
+_YT_PROFILE_BIN = os.path.expanduser("~/.local/bin/yt-profile")
 _YTADD_STATUS = os.path.expanduser("~/.local/state/agent-media/ytadd")
+_HANDLE_RE = re.compile(r"\A[0-9a-f]{8,32}\Z")
 
 
 class YtAddHandler(tornado.web.RequestHandler):
     """Add a book profile via Google login (OAuth device flow).
 
-    POST /mpv/ytadd?name=<n> -> kick off yt-google-add in the background
-                                (writes a status file); returns at once.
-    GET  /mpv/ytadd?name=<n>  -> the current status JSON the page polls
-                                (state: starting|authorize|enumerating|done|error).
+    POST /mpv/ytadd        -> mint an opaque handle, kick off yt-google-add in
+                              the background (the profile is named after the
+                              signed-in channel, so no name is given here);
+                              returns {ok, handle} at once.
+    GET  /mpv/ytadd?h=<h>  -> the current status JSON the page polls
+                              (state: starting|authorize|enumerating|done|error;
+                              done carries {name, channel, playlists}).
     """
 
-    def _status_path(self, name):
-        return os.path.join(_YTADD_STATUS, name + ".json")
-
     def get(self):
-        name = self.get_argument("name", "")
+        handle = self.get_argument("h", "")
         self.set_header("Content-Type", "application/json")
-        if not _NAME_RE.match(name):
+        if not _HANDLE_RE.match(handle):
             self.set_status(400)
-            self.write({"state": "error", "message": "bad name"})
+            self.write({"state": "error", "message": "bad handle"})
             return
         try:
-            with open(self._status_path(name)) as f:
+            with open(os.path.join(_YTADD_STATUS, handle + ".json")) as f:
                 self.write(f.read())
         except OSError:
             self.write({"state": "idle"})
 
     def post(self):
+        handle = secrets.token_hex(8)
+        subprocess.Popen(
+            [_YT_GOOGLE_ADD, handle],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        self.write({"ok": True, "handle": handle})
+
+
+class YtDelHandler(tornado.web.RequestHandler):
+    """Remove a book profile (its login + cached playlists).
+
+    POST /mpv/ytdel?name=<n> -> `yt-profile book rm <n>` (refuses none/active;
+    if it was the active book profile, falls back to 'none' and clears pickers).
+    """
+
+    def post(self):
         name = self.get_argument("name", "")
-        if not _NAME_RE.match(name) or name in ("none", "active", "active-book"):
+        if (not _NAME_RE.match(name)
+                or name in ("none", "active", "active-book")):
             self.set_status(400)
             self.write({"ok": False, "error": "invalid name"})
             return
-        # Don't clobber an existing *cookie* profile; re-login of an existing
-        # Google profile (refresh) is allowed.
-        if (os.path.isfile(os.path.join(_COOKIES_DIR, name + ".txt"))
-                and not _is_oauth(name)):
-            self.set_status(409)
-            self.write({"ok": False, "error": "a cookie profile by that name "
-                                               "already exists"})
+        if not os.path.isfile(os.path.join(_COOKIES_DIR, name + ".txt")):
+            self.set_status(404)
+            self.write({"ok": False, "error": "no such profile"})
             return
-        subprocess.Popen(
-            [_YT_GOOGLE_ADD, name],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True)
+        p = subprocess.run(
+            [_YT_PROFILE_BIN, "book", "rm", name],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if p.returncode != 0:
+            self.set_status(500)
+            self.write({"ok": False, "error": (p.stdout or "").strip()[:200]})
+            return
         self.write({"ok": True, "name": name})
 
 
@@ -331,5 +369,6 @@ def mpv_http_factory(config, core):
     return [(r"/cover", CoverHandler),
             (r"/ytbook", BookProfileHandler),
             (r"/ytadd", YtAddHandler),
+            (r"/ytdel", YtDelHandler),
             (r"/books", BookSwitcherHandler),
             (r"/tv", TvVideoHandler, dict(core=core))]
