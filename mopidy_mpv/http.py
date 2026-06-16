@@ -117,15 +117,28 @@ class BookProfileHandler(tornado.web.RequestHandler):
                     "note": "switching — Refresh the Iris playlists view shortly"})
 
 
+def _is_oauth(name):
+    """True if <name> is a Google-login (OAuth) profile (token has a
+    refresh_token), vs a cookie-derived one."""
+    try:
+        with open(os.path.join(_COOKIES_DIR, name + ".json")) as jf:
+            return '"refresh_token"' in jf.read()
+    except OSError:
+        return False
+
+
 def _book_profiles():
-    """[(name, is_current)] of selectable book profiles + 'none'; OAuth excluded
-    (OAuth tokens HTTP-400 on library reads, so they're useless for the book
-    channel)."""
+    """[(name, is_current, is_oauth)] of selectable book profiles + 'none'.
+
+    OAuth profiles ARE included now: their playlists are enumerated via the
+    YouTube Data API v3 (gen-youtube-books-m3u's OAuth path), which — unlike
+    ytmusicapi's InnerTube — honours these tokens. They're added via the
+    "Add account" Google-login flow (/mpv/ytadd)."""
     try:
         current = os.path.basename(os.readlink(_ACTIVE_BOOK))[:-4]
     except OSError:
         current = "none"
-    names = []
+    out = []
     try:
         for f in sorted(os.listdir(_COOKIES_DIR)):
             if not f.endswith(".txt"):
@@ -133,40 +146,72 @@ def _book_profiles():
             n = f[:-4]
             if n.startswith("active") or n == "none":
                 continue
-            try:
-                with open(os.path.join(_COOKIES_DIR, n + ".json")) as jf:
-                    if '"refresh_token"' in jf.read():
-                        continue
-            except OSError:
-                pass
-            names.append(n)
+            out.append((n, n == current, _is_oauth(n)))
     except OSError:
         pass
-    names.append("none")
-    return [(n, n == current) for n in names]
+    out.append(("none", current == "none", False))
+    return out
 
 
 # Standalone, phone-friendly switcher page. Bookmark it on Android; the <select>
-# scales to any number of profiles. Talks to /mpv/ytbook (same origin).
+# scales to any number of profiles. Talks to /mpv/ytbook + /mpv/ytadd (same
+# origin). Uses a __OPTIONS__ placeholder (not str.format) so the JS braces stay
+# readable. The "Add account" box runs the Google-login (OAuth device) flow.
 _SWITCHER_HTML = """<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Book account</title><style>
- body{{font-family:system-ui,sans-serif;max-width:480px;margin:1.5rem auto;padding:0 1.2rem;color:#222}}
- h2{{font-weight:600}} select{{font-size:1.25rem;padding:.7rem;width:100%;border-radius:.6rem;border:1px solid #bbb}}
- #status{{margin-top:1.1rem;min-height:1.4em;color:#666}} small{{color:#999}}
+ body{font-family:system-ui,sans-serif;max-width:480px;margin:1.5rem auto;padding:0 1.2rem;color:#222}
+ h2{font-weight:600} h3{font-weight:600;font-size:1rem;margin:1.6rem 0 .5rem}
+ select,input{font-size:1.15rem;padding:.6rem;width:100%;border-radius:.6rem;border:1px solid #bbb;box-sizing:border-box}
+ button{font-size:1.05rem;padding:.6rem 1rem;margin-top:.6rem;border:0;border-radius:.6rem;background:#1b1b1b;color:#fff;cursor:pointer}
+ button[disabled]{opacity:.5}
+ #status,#addstatus{margin-top:1rem;min-height:1.4em;color:#555}
+ .code{font:700 1.5rem/1.2 ui-monospace,monospace;letter-spacing:.12em;background:#f3f3f3;padding:.5rem .7rem;border-radius:.5rem;display:inline-block;margin:.3rem 0}
+ a.go{display:inline-block;margin-top:.4rem} small{color:#999} hr{border:0;border-top:1px solid #eee;margin:1.6rem 0}
 </style></head><body>
 <h2>\U0001F4D6 Book channel &middot; YouTube account</h2>
-<select id=sel>{options}</select>
+<select id=sel>__OPTIONS__</select>
 <p id=status></p>
 <p><small>Pick an account, then hit Refresh in the Iris playlists view. First load of a big account takes ~1&ndash;2&nbsp;min; switching back is instant.</small></p>
+<hr>
+<h3>➕ Add account &middot; Google login</h3>
+<input id=name placeholder="name for this account (e.g. davids-youtube)" autocapitalize=off autocorrect=off spellcheck=false>
+<button id=add>Sign in with Google</button>
+<div id=addstatus></div>
+<p><small>No cookie upload needed. Your playlists are read via YouTube's official API and the login refreshes itself. (Shows your <em>own</em> playlists, not ones saved from other channels.)</small></p>
 <script>
  var sel=document.getElementById('sel'),st=document.getElementById('status');
- sel.onchange=function(){{
+ sel.onchange=function(){
    st.textContent='Switching to '+sel.value+'\\u2026';
-   fetch('/mpv/ytbook?name='+encodeURIComponent(sel.value)).then(function(r){{return r.json()}})
-    .then(function(j){{st.textContent=j.ok?(j.note||'Switched.'):('Error: '+(j.error||'failed'))}})
-    .catch(function(e){{st.textContent='Error: '+e}});
- }};
+   fetch('/mpv/ytbook?name='+encodeURIComponent(sel.value)).then(function(r){return r.json()})
+    .then(function(j){st.textContent=j.ok?(j.note||'Switched.'):('Error: '+(j.error||'failed'))})
+    .catch(function(e){st.textContent='Error: '+e});
+ };
+ var addBtn=document.getElementById('add'),nameEl=document.getElementById('name'),as=document.getElementById('addstatus'),poll=null;
+ function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+ function render(j){
+   if(j.state==='authorize'){
+     as.innerHTML='Open <a class=go target=_blank rel=noopener href="'+esc(j.verification_url)+'">'+esc(j.verification_url)+'</a> and enter:<br><span class=code>'+esc(j.user_code||'')+'</span><br><small>Waiting for you to approve\\u2026</small>';
+   } else if(j.state==='starting'){ as.textContent='Starting Google login\\u2026'; }
+   else if(j.state==='enumerating'){ as.textContent='Approved \\u2713  Loading your playlists\\u2026'; }
+   else if(j.state==='done'){ clearInterval(poll);poll=null;addBtn.disabled=false;
+     as.innerHTML='\\u2713 Added '+esc(nameEl.value)+' with '+(j.playlists||0)+' playlists. Reloading\\u2026';
+     setTimeout(function(){location.reload()},1500); }
+   else if(j.state==='error'){ clearInterval(poll);poll=null;addBtn.disabled=false;
+     as.textContent='Error: '+(j.message||'failed'); }
+ }
+ addBtn.onclick=function(){
+   var name=(nameEl.value||'').trim();
+   if(!/^[A-Za-z0-9_-]{1,40}$/.test(name)){as.textContent='Pick a name: letters, numbers, - or _ (no spaces).';return;}
+   addBtn.disabled=true; as.textContent='Starting Google login\\u2026';
+   fetch('/mpv/ytadd?name='+encodeURIComponent(name),{method:'POST'})
+    .then(function(r){return r.json()})
+    .then(function(j){ if(!j.ok){addBtn.disabled=false;as.textContent='Error: '+(j.error||'failed');return;}
+      poll=setInterval(function(){
+        fetch('/mpv/ytadd?name='+encodeURIComponent(name)).then(function(r){return r.json()}).then(render).catch(function(){});
+      },2500);
+    }).catch(function(e){addBtn.disabled=false;as.textContent='Error: '+e});
+ };
 </script></body></html>"""
 
 
@@ -175,10 +220,61 @@ class BookSwitcherHandler(tornado.web.RequestHandler):
         opts = "".join(
             '<option value="{n}"{sel}>{label}</option>'.format(
                 n=n, sel=(" selected" if cur else ""),
-                label=(n + " — off" if n == "none" else n))
-            for n, cur in _book_profiles())
+                label=(n + " — off" if n == "none"
+                       else (n + " · Google" if oauth else n)))
+            for n, cur, oauth in _book_profiles())
         self.set_header("Content-Type", "text/html; charset=utf-8")
-        self.write(_SWITCHER_HTML.format(options=opts))
+        self.write(_SWITCHER_HTML.replace("__OPTIONS__", opts))
+
+
+_YT_GOOGLE_ADD = os.path.expanduser("~/.local/bin/yt-google-add")
+_YTADD_STATUS = os.path.expanduser("~/.local/state/agent-media/ytadd")
+
+
+class YtAddHandler(tornado.web.RequestHandler):
+    """Add a book profile via Google login (OAuth device flow).
+
+    POST /mpv/ytadd?name=<n> -> kick off yt-google-add in the background
+                                (writes a status file); returns at once.
+    GET  /mpv/ytadd?name=<n>  -> the current status JSON the page polls
+                                (state: starting|authorize|enumerating|done|error).
+    """
+
+    def _status_path(self, name):
+        return os.path.join(_YTADD_STATUS, name + ".json")
+
+    def get(self):
+        name = self.get_argument("name", "")
+        self.set_header("Content-Type", "application/json")
+        if not _NAME_RE.match(name):
+            self.set_status(400)
+            self.write({"state": "error", "message": "bad name"})
+            return
+        try:
+            with open(self._status_path(name)) as f:
+                self.write(f.read())
+        except OSError:
+            self.write({"state": "idle"})
+
+    def post(self):
+        name = self.get_argument("name", "")
+        if not _NAME_RE.match(name) or name in ("none", "active", "active-book"):
+            self.set_status(400)
+            self.write({"ok": False, "error": "invalid name"})
+            return
+        # Don't clobber an existing *cookie* profile; re-login of an existing
+        # Google profile (refresh) is allowed.
+        if (os.path.isfile(os.path.join(_COOKIES_DIR, name + ".txt"))
+                and not _is_oauth(name)):
+            self.set_status(409)
+            self.write({"ok": False, "error": "a cookie profile by that name "
+                                               "already exists"})
+            return
+        subprocess.Popen(
+            [_YT_GOOGLE_ADD, name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        self.write({"ok": True, "name": name})
 
 
 class TvVideoHandler(tornado.web.RequestHandler):
@@ -234,5 +330,6 @@ def mpv_http_factory(config, core):
     # /mpv/tv (play now-playing on the lounge TV's mpvKt).
     return [(r"/cover", CoverHandler),
             (r"/ytbook", BookProfileHandler),
+            (r"/ytadd", YtAddHandler),
             (r"/books", BookSwitcherHandler),
             (r"/tv", TvVideoHandler, dict(core=core))]
