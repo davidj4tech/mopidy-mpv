@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Add a YouTube account via a Google login, for the Iris account popover.
+
+Run in the background by this plugin's /mpv/ytadd endpoint (keyed by an opaque
+<handle>). Two flows, both writing a status file the popover polls:
+
+  device flow (default) — `yt-google-add <handle>`
+     Uses a "TVs and Limited Input devices" OAuth client (oauth_client.json):
+     prints a code; the UI shows a one-tap pre-filled google.com/device link.
+
+  auth-code flow (fully code-free) — `yt-google-add --code <handle> <code>`
+     Invoked by the /mpv/ytcb redirect handler after the user approves in a
+     browser. Exchanges the code (web-app client oauth_web.json + redirect_uri)
+     for tokens. Needs an HTTPS redirect URI (e.g. via `tailscale serve`).
+
+On success it writes `<name>.json` (an auto-refreshing token, named after the
+signed-in channel) and a cookieless `<name>.txt` playback jar into YT_OAUTH_DIR,
+stamps the issuing client ('web'/'device') so a refresher uses the matching
+creds, then runs YT_ACTIVATE_CMD (where you plug in your playlist enumerator /
+"make this the active account" step).
+
+Status file: $YT_STATUS_DIR/<handle>.json — states:
+  starting -> authorize{...} -> enumerating{channel} -> done{name,channel,playlists}
+  (or error{message}).
+
+Config via env:
+  YT_OAUTH_DIR     dir holding oauth_client.json / oauth_web.json + tokens
+                   (default ~/.config/yt-dlp/cookies)
+  YT_STATUS_DIR    status files the popover polls
+                   (default ~/.local/state/iris-yt/ytadd)
+  YT_ACTIVATE_CMD  optional shell-split command run after login with the new
+                   profile name appended (wire your enumerator / activation)
+  YT_PLAYLISTS_DIR optional; if set, 'done' reports the count of "YT - *.m3u8"
+                   pickers there, else playlists=null
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+OAUTH_DIR = os.path.expanduser(
+    os.environ.get("YT_OAUTH_DIR", "~/.config/yt-dlp/cookies"))
+STATUS_DIR = os.path.expanduser(
+    os.environ.get("YT_STATUS_DIR", "~/.local/state/iris-yt/ytadd"))
+ACTIVATE_CMD = os.environ.get("YT_ACTIVATE_CMD", "")
+PLAYLISTS_DIR = os.path.expanduser(os.environ.get("YT_PLAYLISTS_DIR", "")) \
+    if os.environ.get("YT_PLAYLISTS_DIR") else ""
+OAUTH_CLIENT = os.path.join(OAUTH_DIR, "oauth_client.json")   # device (TV) client
+OAUTH_WEB = os.path.join(OAUTH_DIR, "oauth_web.json")         # web-app client
+SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+DEVICE_URL = "https://oauth2.googleapis.com/device/code"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+API = "https://www.googleapis.com/youtube/v3"
+HANDLE_RE = re.compile(r"\A[0-9a-f]{8,32}\Z")
+RESERVED = {"none", "active", "active-book", "oauth_client", "oauth_web"}
+
+
+def _post(url, fields):
+    data = urllib.parse.urlencode(fields).encode()
+    try:
+        with urllib.request.urlopen(url, data, timeout=30) as r:
+            return r.getcode(), json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.load(e)
+        except Exception:  # noqa: BLE001
+            return e.code, {"error": "http_error"}
+
+
+def _slugify(title):
+    s = re.sub(r"[^A-Za-z0-9]+", "-", title or "").strip("-").lower()
+    s = re.sub(r"-{2,}", "-", s)
+    return s[:40] or "youtube"
+
+
+def _is_oauth(name):
+    try:
+        with open(os.path.join(OAUTH_DIR, name + ".json")) as f:
+            return '"refresh_token"' in f.read()
+    except OSError:
+        return False
+
+
+def _unique_name(base):
+    if base in RESERVED:
+        base = base + "-yt"
+    if not os.path.exists(os.path.join(OAUTH_DIR, base + ".txt")) \
+            or _is_oauth(base):
+        return base
+    i = 2
+    while os.path.exists(os.path.join(OAUTH_DIR, f"{base}-{i}.txt")):
+        i += 1
+    return f"{base}-{i}"
+
+
+def _channel(at):
+    req = urllib.request.Request(
+        f"{API}/channels?" + urllib.parse.urlencode(
+            {"part": "snippet", "mine": "true"}),
+        headers={"Authorization": "Bearer " + at})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        items = json.load(r).get("items", [])
+    if not items:
+        return None, None
+    return items[0]["snippet"]["title"], items[0]["id"]
+
+
+def _make_status(handle):
+    os.makedirs(STATUS_DIR, exist_ok=True)
+    path = os.path.join(STATUS_DIR, f"{handle}.json")
+
+    def status(state, **kw):
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"state": state, **kw}, f)
+        os.replace(tmp, path)
+    return status
+
+
+def _finish(token, status, issuer):
+    """Shared tail: name from channel, persist token + cookieless playback jar,
+    run the activate hook, report done. `issuer` ('web'/'device') is stamped so
+    a refresher uses the matching client's creds (a refresh token only works
+    with the client that issued it)."""
+    try:
+        title, chan_id = _channel(token["access_token"])
+    except (urllib.error.URLError, OSError, KeyError):
+        title, chan_id = None, None
+    name = _unique_name(_slugify(title))
+    tok_out = {k: token[k] for k in token if k != "id_token"}
+    tok_out["issuer"] = issuer
+    if chan_id:
+        tok_out["channel_id"] = chan_id
+    os.makedirs(OAUTH_DIR, exist_ok=True)
+    fd = os.open(os.path.join(OAUTH_DIR, f"{name}.json"),
+                 os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(tok_out, f)
+    txt_path = os.path.join(OAUTH_DIR, f"{name}.txt")
+    if not os.path.exists(txt_path):
+        none_txt = os.path.join(OAUTH_DIR, "none.txt")
+        data = open(none_txt).read() if os.path.exists(none_txt) else \
+            "# Netscape HTTP Cookie File\n"
+        fd = os.open(txt_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+    status("enumerating", name=name, channel=title or name)
+    if ACTIVATE_CMD:
+        try:
+            subprocess.run(shlex.split(ACTIVATE_CMD) + [name],
+                           capture_output=True, text=True, timeout=600)
+        except Exception:  # noqa: BLE001
+            pass
+    n = None
+    if PLAYLISTS_DIR and os.path.isdir(PLAYLISTS_DIR):
+        n = len([f for f in os.listdir(PLAYLISTS_DIR)
+                 if f.startswith("YT - ") and f.endswith(".m3u8")])
+    status("done", name=name, channel=title or name, playlists=n)
+
+
+def run_code_flow(handle, code):
+    status = _make_status(handle)
+    try:
+        web = json.load(open(OAUTH_WEB))
+    except OSError:
+        status("error", message="no web OAuth client configured")
+        sys.exit(1)
+    status("enumerating", channel="")
+    rc, tok = _post(TOKEN_URL, {
+        "client_id": web["client_id"], "client_secret": web["client_secret"],
+        "code": code, "redirect_uri": web["redirect_uri"],
+        "grant_type": "authorization_code"})
+    if rc != 200 or "access_token" not in tok:
+        status("error", message=f"token exchange failed ({tok.get('error')})")
+        sys.exit(1)
+    _finish(tok, status, "web")
+
+
+def run_device_flow(handle):
+    status = _make_status(handle)
+    status("starting")
+    try:
+        client = json.load(open(OAUTH_CLIENT))
+    except OSError:
+        status("error", message="no OAuth client configured on the server")
+        sys.exit(1)
+    rc, dev = _post(DEVICE_URL, {"client_id": client["client_id"],
+                                 "scope": SCOPE})
+    if rc != 200 or "device_code" not in dev:
+        status("error", message=f"could not start Google login ({dev.get('error')})")
+        sys.exit(1)
+    verify = dev.get("verification_url") or dev.get("verification_uri")
+    complete = (dev.get("verification_url_complete")
+                or dev.get("verification_uri_complete"))
+    if not complete and verify:
+        sep = "&" if "?" in verify else "?"
+        complete = f"{verify}{sep}user_code={dev['user_code']}"
+    interval = int(dev.get("interval", 5))
+    deadline = time.monotonic() + int(dev.get("expires_in", 1800))
+    status("authorize", user_code=dev["user_code"], verification_url=verify,
+           verification_url_complete=complete,
+           expires_in=int(dev.get("expires_in", 1800)))
+    token = None
+    while time.monotonic() < deadline:
+        time.sleep(interval)
+        rc, tok = _post(TOKEN_URL, {
+            "client_id": client["client_id"],
+            "client_secret": client["client_secret"],
+            "device_code": dev["device_code"],
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code"})
+        if rc == 200 and "access_token" in tok:
+            token = tok
+            break
+        err = tok.get("error")
+        if err == "authorization_pending":
+            continue
+        if err == "slow_down":
+            interval += 5
+            continue
+        if err == "access_denied":
+            status("error", message="login was denied")
+            sys.exit(1)
+        if err == "expired_token":
+            break
+        status("error", message=f"login failed ({err})")
+        sys.exit(1)
+    if token is None:
+        status("error", message="login timed out — try again")
+        sys.exit(1)
+    _finish(token, status, "device")
+
+
+def main(argv):
+    args = argv[1:]
+    if args and args[0] == "--code":
+        if len(args) != 3 or not HANDLE_RE.match(args[1]):
+            sys.exit("usage: yt-google-add --code <handle> <code>")
+        run_code_flow(args[1], args[2])
+        return
+    if len(args) != 1 or not HANDLE_RE.match(args[0]):
+        sys.exit("usage: yt-google-add <handle>  (8-32 hex chars)")
+    run_device_flow(args[0])
+
+
+if __name__ == "__main__":
+    main(sys.argv)

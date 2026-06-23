@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Make Mopidy-Iris's service worker self-update and serve a fresh index.html.
+
+Run this with a Python that can `import mopidy_iris` (i.e. the venv/interpreter
+your Mopidy runs in).
+
+Iris ships a *cache-first* service worker that never revalidates, so an injected
+UI change (the sidebar/popover patch from `iris-inject-accounts`) stays invisible
+until the SW's 'iris' cache is deleted — which only happens when a NEW service
+worker activates. We prepend a small block that:
+
+  * skipWaiting + clients.claim  -> the updated SW takes over on the very next
+    load (no need to close every tab/PWA), and Iris's own activate handler then
+    deletes all old caches;
+  * network-first for navigations -> index.html is always fetched fresh when
+    online (cache only as an offline fallback), so future index.html changes
+    propagate without any manual cache clear.
+
+The block is stamped with a hash of the current index.html, so re-running this
+AFTER the index injector changes the SW's bytes -> browsers detect the SW update
+and roll it out. Idempotent + self-replacing; wire it LAST in Mopidy's
+service ExecStartPre (after `iris-inject-accounts`).
+"""
+import hashlib
+import os
+import re
+
+import mopidy_iris
+
+STATIC = os.path.join(os.path.dirname(mopidy_iris.__file__), "static")
+SW = os.path.join(STATIC, "service-worker.js")
+IDX = os.path.join(STATIC, "index.html")
+START = "/*IRIS-YT-SW:start"
+END = "IRIS-YT-SW:end*/"
+
+
+def block(ver):
+    return (
+        f"{START} {ver} — prompt SW self-update + network-first navigation so "
+        "injected UI changes propagate without a manual cache clear */\n"
+        "self.addEventListener('install', () => self.skipWaiting());\n"
+        "self.addEventListener('activate', (e) => e.waitUntil("
+        "self.clients.claim()));\n"
+        "self.addEventListener('fetch', (event) => {\n"
+        "  if (event.request.mode === 'navigate') {\n"
+        "    event.respondWith(\n"
+        "      fetch(event.request).catch(\n"
+        "        () => caches.open('iris').then((c) => c.match(event.request)),\n"
+        "      ),\n"
+        "    );\n"
+        "  }\n"
+        f"}});\n/* {END}\n"
+    )
+
+
+def main():
+    try:
+        sw = open(SW).read()
+        idx = open(IDX, "rb").read()
+    except OSError as e:
+        raise SystemExit(f"iris static not found: {e}")
+    ver = hashlib.sha256(idx).hexdigest()[:12]
+    sw = re.sub(re.escape(START) + r".*?" + re.escape(END), "", sw,
+                flags=re.S).lstrip("\n")
+    new = block(ver) + sw
+    if new == open(SW).read():
+        print("iris SW patch already current")
+        return
+    with open(SW, "w") as f:
+        f.write(new)
+    print(f"patched iris service-worker (index ver {ver})")
+
+
+if __name__ == "__main__":
+    main()
