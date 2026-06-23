@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Add a YouTube-account switcher/adder to Mopidy-Iris's own sidebar nav.
+
+Run this with a Python that can `import mopidy_iris` (your Mopidy venv).
+
+Iris has no plugin hook for custom nav, so we patch its served index.html with a
+small `<script>` that injects a native-looking `sidebar__menu__item`. Clicking it
+opens a compact in-place POPOVER (no separate page, no iframe): a dropdown to
+switch the active YouTube account + an "Add account" (Google login) button + a
+small Remove. It talks to this plugin's /mpv/ytbook|ytadd|ytdel endpoints via
+fetch. A MutationObserver re-adds the item whenever React (re)renders the
+sidebar.
+
+Self-replacing: each run strips the previously-injected block and writes the
+current one, so wiring it into Mopidy's service ExecStartPre keeps it current
+across Iris upgrades. Iris is a PWA — pair this with `iris-inject-sw` (run it
+AFTER this) so clients pick the change up without a manual cache clear.
+
+Config via env:
+  IRIS_YT_PORT  if set, only inject on that Iris port (when several Mopidy
+                instances share one index.html). Default: inject on any port.
+"""
+import os
+import re
+
+import mopidy_iris
+
+IDX = os.path.join(os.path.dirname(mopidy_iris.__file__), "static", "index.html")
+TOKEN = "IRIS-YT-ACCT"
+# JS literal for the port gate: '<port>' to restrict, '' to apply everywhere.
+PORT = os.environ.get("IRIS_YT_PORT", "")
+PORT_JS = f"'{PORT}'" if PORT else "''"
+
+SNIPPET = (
+    "<script>/*IRIS-YT-ACCT*/"
+    "(function(){var PORT=__PORT__;if(PORT&&location.port!==PORT)return;"
+    "var ID='yt-acct-nav',POP='yt-acct-pop';"
+    "function esc(s){var d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}"
+    "function jget(u){return fetch(u).then(function(r){return r.json();});}"
+    "function jpost(u){return fetch(u,{method:'POST'}).then(function(r){return r.json();});}"
+    "function onKey(e){if(e.key==='Escape')closePop();}"
+    "function outside(e){var p=document.getElementById(POP);if(!p)return;"
+    "if(!p.contains(e.target)&&!(e.target.closest&&e.target.closest('#'+ID)))closePop();}"
+    "function closePop(){var p=document.getElementById(POP);if(p)p.remove();"
+    "document.removeEventListener('keydown',onKey);document.removeEventListener('mousedown',outside);}"
+    "function place(p,a){var r=a.getBoundingClientRect(),w=290,left=r.right+6,top=r.top;"
+    "if(left+w>window.innerWidth-8)left=Math.max(8,window.innerWidth-w-8);"
+    "if(top+330>window.innerHeight)top=Math.max(8,window.innerHeight-330);"
+    "p.style.left=left+'px';p.style.top=top+'px';p.style.width=w+'px';}"
+    "function togglePop(a){"
+    "if(document.getElementById(POP)){closePop();return;}"
+    "var p=document.createElement('div');p.id=POP;"
+    "p.style.cssText='position:fixed;z-index:9000;background:#fff;color:#222;border:1px solid #ccc;"
+    "border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.25);padding:12px;font:14px system-ui';"
+    "p.innerHTML='<div style=\\\"font-weight:600;margin-bottom:6px\\\">\\uD83D\\uDCFA YouTube account</div>'"
+    "+'<select id=ytap-sel style=\\\"width:100%;padding:.5rem;border-radius:.5rem;border:1px solid #bbb;font-size:1rem\\\"></select>'"
+    "+'<div style=\\\"display:flex;gap:8px;margin-top:8px\\\"><button id=ytap-add style=\\\"flex:1;border:0;border-radius:.5rem;background:#1b1b1b;color:#fff;padding:.5rem;cursor:pointer\\\">Add account</button>'"
+    "+'<button id=ytap-rm title=\\\"Remove selected\\\" style=\\\"border:1px solid #ddd;background:#fff;color:#b00;border-radius:.5rem;padding:.5rem .7rem;cursor:pointer\\\">Remove</button></div>'"
+    "+'<div id=ytap-msg style=\\\"margin-top:8px;min-height:1.2em;color:#555;font-size:13px\\\"></div>';"
+    "document.body.appendChild(p);place(p,a);"
+    "document.addEventListener('keydown',onKey);"
+    "setTimeout(function(){document.addEventListener('mousedown',outside);},0);"
+    "var sel=p.querySelector('#ytap-sel'),msg=p.querySelector('#ytap-msg'),"
+    "addB=p.querySelector('#ytap-add'),rmB=p.querySelector('#ytap-rm'),poll=null;"
+    "function populate(){return jget('/mpv/ytbook').then(function(j){var cur=j.current,pr=j.profiles||[];"
+    "sel.innerHTML='';pr.forEach(function(x){var o=document.createElement('option');o.value=x.name;"
+    "o.textContent=x.name==='none'?'none \\u2014 off':(x.oauth?x.name+' \\u00b7 Google':x.name);"
+    "if(x.name===cur)o.selected=true;sel.appendChild(o);});}).catch(function(){msg.textContent='Could not load accounts.';});}"
+    "populate();"
+    "sel.onchange=function(){msg.textContent='Switching\\u2026';"
+    "jget('/mpv/ytbook?name='+encodeURIComponent(sel.value)).then(function(j){"
+    "msg.textContent=j.ok?'Switched. Hit Refresh in the playlists view.':('Error: '+(j.error||'failed'));});};"
+    "rmB.onclick=function(){var n=sel.value;if(n==='none'){msg.textContent='Nothing to remove.';return;}"
+    "if(!confirm('Remove account \"'+n+'\"? Deletes its saved login + playlists.'))return;"
+    "msg.textContent='Removing\\u2026';jpost('/mpv/ytdel?name='+encodeURIComponent(n)).then(function(j){"
+    "if(j.ok){msg.textContent='Removed '+n+'.';populate();}else msg.textContent='Error: '+(j.error||'failed');});};"
+    "addB.onclick=function(){addB.disabled=true;msg.textContent='Starting Google login\\u2026';"
+    "jpost('/mpv/ytadd').then(function(j){if(!j.ok||!j.handle){addB.disabled=false;msg.textContent='Error: '+(j.error||'failed');return;}"
+    "if(j.auth_url){window.open(j.auth_url,'_blank');}"
+    "var h=j.handle;poll=setInterval(function(){jget('/mpv/ytadd?h='+encodeURIComponent(h)).then(function(s){"
+    "if(s.state==='authorize'){var u=s.auth_url||s.verification_url_complete||s.verification_url;"
+    "msg.innerHTML='<a target=_blank rel=noopener href=\\\"'+esc(u)+'\\\" style=\\\"display:inline-block;background:#1b1b1b;color:#fff;padding:.45rem .8rem;border-radius:.5rem;text-decoration:none\\\">'+(s.auth_url?'Sign in with Google \\u2192':'Approve in Google \\u2192')+'</a><br><small>'+(s.auth_url?'approve in the Google tab (opens automatically)':'code <b>'+esc(s.user_code)+'</b> is pre-filled \\u2014 just confirm')+'</small>';}"
+    "else if(s.state==='enumerating'){msg.textContent='Approved \\u2713 ('+(s.channel||'')+') \\u2014 loading playlists\\u2026';}"
+    "else if(s.state==='done'){clearInterval(poll);poll=null;addB.disabled=false;"
+    "msg.innerHTML='\\u2713 Added <b>'+esc(s.channel||s.name)+'</b>'+(s.playlists!=null?' ('+s.playlists+' playlists)':'')+'. Hit Refresh in the playlists view.';populate();}"
+    "else if(s.state==='error'){clearInterval(poll);poll=null;addB.disabled=false;msg.textContent='Error: '+(s.message||'failed');}"
+    "}).catch(function(){});},2500);}).catch(function(e){addB.disabled=false;msg.textContent='Error: '+e;});};"
+    "}"
+    "window.addEventListener('resize',function(){var p=document.getElementById(POP),a=document.getElementById(ID);if(p&&a)place(p,a);});"
+    "function inject(){"
+    "if(document.getElementById(ID))return;"
+    "var sec=document.querySelector('.sidebar__menu__section');if(!sec)return;"
+    "var a=document.createElement('a');a.id=ID;a.className='sidebar__menu__item';a.href='#';"
+    "a.title='YouTube accounts';"
+    "var ic=document.createElement('i');ic.className='icon icon--material material-icons';"
+    "ic.textContent='switch_account';"
+    "a.appendChild(ic);a.appendChild(document.createTextNode('Account'));"
+    "a.onclick=function(e){e.preventDefault();togglePop(a);};"
+    "sec.appendChild(a);}"
+    "var obs=new MutationObserver(inject);"
+    "function start(){if(!document.body){setTimeout(start,200);return;}"
+    "obs.observe(document.body,{childList:true,subtree:true});inject();}"
+    "start();})();</script>"
+).replace("__PORT__", PORT_JS)
+
+
+def strip_ours(html):
+    """Remove our injected attribute-less <script> block. Iris's own bundle uses
+    `<script defer src=…>` (with attributes), so the bare `<script>…</script>`
+    pattern only matches ours."""
+    def repl(m):
+        return "" if TOKEN in m.group(0) else m.group(0)
+    return re.sub(r"<script>.*?</script>\n?", repl, html, flags=re.S)
+
+
+def main():
+    try:
+        with open(IDX) as f:
+            html = f.read()
+    except OSError as e:
+        raise SystemExit(f"iris index.html not found: {e}")
+    if "</body>" not in html:
+        raise SystemExit("no </body> in iris index.html — cannot inject")
+    new = strip_ours(html).replace("</body>", SNIPPET + "\n</body>", 1)
+    if new == html:
+        print("YouTube account nav item already current")
+        return
+    with open(IDX, "w") as f:
+        f.write(new)
+    print(f"injected YouTube account sidebar nav item -> {IDX}")
+
+
+if __name__ == "__main__":
+    main()
